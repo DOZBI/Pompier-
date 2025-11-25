@@ -1,240 +1,192 @@
-// ze-plan/index.ts
-
 import "https://deno.land/x/xhr@0.1.0/mod.ts";
-import { serve } from "https://deno.land/std@0.224.0/http/server.ts"; 
-import { encodeBase64 } from "https://deno.land/std@0.224.0/encoding/base64.ts";
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.42.0'; 
-
-interface PlanRequest {
-  planUrl: string;
-  houseId: string;
-  mode: 'operational' | 'preventive';
-  contextData?: Record<string, any>;
-  promptInstruction?: string;
-}
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.7.1';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'POST, OPTIONS', 
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
-// Fonction helper pour appeler Gemini
-async function callGemini(model: string, apiKey: string, body: any) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  });
-  return response;
+// Fonction helper pour convertir les gros fichiers en Base64 par morceaux
+// Indispensable pour éviter "Maximum call stack size exceeded" sur les gros plans
+function arrayBufferToBase64(buffer: ArrayBuffer) {
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  const len = bytes.byteLength;
+  const chunkSize = 1024 * 32; // 32KB
+
+  for (let i = 0; i < len; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    // @ts-ignore: apply accepts typed array
+    binary += String.fromCharCode.apply(null, chunk);
+  }
+  return btoa(binary);
 }
 
 serve(async (req) => {
+  // 1. Gestion CORS
   if (req.method === 'OPTIONS') {
-    return new Response(null, { status: 204, headers: corsHeaders });
+    return new Response(null, { headers: corsHeaders });
   }
-
-  if (req.method !== 'POST') {
-     return new Response(JSON.stringify({ error: 'Méthode non supportée. Utilisez POST.' }), {
-      status: 405,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
-  }
-
-  let houseId: string | undefined;
 
   try {
-    const requestBody: PlanRequest = await req.json();
-    const { planUrl, houseId: id, mode, contextData, promptInstruction } = requestBody;
-    
-    houseId = id;
+    const { planUrl, houseId, mode, contextData, promptInstruction } = await req.json();
 
-    if (!planUrl || !houseId || !mode) {
-      throw new Error('planUrl, houseId, et mode sont requis dans le corps de la requête.');
-    }
+    if (!planUrl || !houseId) throw new Error('Paramètres manquants (planUrl ou houseId)');
 
-    const supabaseUrl = Deno.env.get('SUPABASE_URL');
-    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
-
-    if (!supabaseUrl || !supabaseKey) {
-        throw new Error('Les secrets SUPABASE_URL et SUPABASE_SERVICE_ROLE_KEY doivent être configurés.');
-    }
-
-    const supabaseClient = createClient(supabaseUrl, supabaseKey);
+    // 2. Configuration
+    const supabase = createClient(
+      Deno.env.get('SUPABASE_URL') ?? '',
+      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
+    );
 
     const googleApiKey = Deno.env.get('GOOGLE_API_KEY');
-    if (!googleApiKey) {
-      throw new Error('GOOGLE_API_KEY doit être configurée dans les secrets Supabase.');
-    }
+    if (!googleApiKey) throw new Error('GOOGLE_API_KEY manquante');
 
-    console.log(`[House ${houseId}] Début du traitement du plan en mode: ${mode}`);
-    
-    // --- Téléchargement Image ---
+    console.log(`[${houseId}] Téléchargement du plan...`);
+
+    // 3. Téléchargement et Encodage Image (Interne + Fallback)
     let imageBuffer: ArrayBuffer;
-    let mimeType: string;
-    const bucketName = 'house-plans';
-
     try {
       const urlObj = new URL(planUrl);
-      const pathSegment = urlObj.pathname.split(`/${bucketName}/`)[1];
-      
-      if (!pathSegment) throw new Error("Path incorrect");
-      
-      const filePath = decodeURIComponent(pathSegment);
-      console.log(`[House ${houseId}] Téléchargement interne: ${filePath}`);
-
-      const { data, error: downloadError } = await supabaseClient
-        .storage
-        .from(bucketName)
-        .download(filePath);
-
-      if (downloadError) throw downloadError;
-      
+      const filePath = decodeURIComponent(urlObj.pathname.split('house-plans/')[1]);
+      const { data, error } = await supabase.storage.from('house-plans').download(filePath);
+      if (error) throw error;
       imageBuffer = await data.arrayBuffer();
-      mimeType = data.type.startsWith('image/') ? data.type : 'image/jpeg'; 
-      
     } catch (err) {
-      console.warn(`[House ${houseId}] Fallback fetch public: ${planUrl}`);
-      const imageResponse = await fetch(planUrl);
-      if (!imageResponse.ok) throw new Error(`Erreur fetch image: ${imageResponse.status}`);
-      
-      const contentType = imageResponse.headers.get("Content-Type");
-      if (!contentType?.startsWith('image/')) throw new Error(`Type invalide: ${contentType}`);
-      
-      mimeType = contentType; 
-      imageBuffer = await imageResponse.arrayBuffer();
+      console.warn("Download interne échoué, fallback public...", err);
+      const res = await fetch(planUrl);
+      if (!res.ok) throw new Error("Impossible de télécharger l'image");
+      imageBuffer = await res.arrayBuffer();
     }
 
-    const base64Image = encodeBase64(imageBuffer);
-    console.log(`[House ${houseId}] Image OK (${base64Image.length} chars). MIME: ${mimeType}`);
+    const base64Image = arrayBufferToBase64(imageBuffer);
+    console.log(`Image encodée. Envoi à Gemini...`);
 
-    // --- Préparation Prompt ---
-    let systemInstruction = "";
+    // 4. Préparation du Prompt (Système)
+    let systemPrompt = "";
     let userPrompt = "";
-    
-    // CORRECTION : Utilisation de la version spécifique "002"
-    let targetModel = "gemini-1.5-flash-002"; 
-    
-    const isOperationalMode = mode === 'operational';
 
-    if (isOperationalMode) {
-      systemInstruction = `Tu es un expert opérationnel pompier. Contexte: ${JSON.stringify(contextData || {})}.`;
-      userPrompt = `${promptInstruction || "Rapport opérationnel."}
-      IMPORTANT: Retourne UNIQUEMENT un JSON valide (sans Markdown) avec cette structure:
+    if (mode === 'operational') {
+      systemPrompt = `Tu es un expert opérationnel pompier (Commandant des Opérations de Secours).
+      Ton rôle est d'analyser visuellement le plan fourni pour une intervention tactique.
+      Contexte fourni par le propriétaire : ${JSON.stringify(contextData)}.
+      
+      Analyse requise :
+      1. Identification immédiate des accès (A1, A2...).
+      2. Zones à Risque Accru (ZRA) : Cuisine, locaux techniques, stockage.
+      3. Voies d'Évacuation (VE).
+      4. Recommandations tactiques pour l'engagement.
+      
+      Structure JSON OBLIGATOIRE :
       {
-        "operational_summary": "Synthèse SITAC.",
+        "operational_summary": "Synthèse tactique courte.",
         "access_points": [{"id": "A1", "location": "...", "description": "..."}],
         "evacuation_routes": [{"name": "...", "description": "..."}],
         "risk_zones": [{"zone": "...", "risk": "...", "tactical_advice": "..."}],
-        "tactical_recommendations": ["..."]
+        "tactical_recommendations": ["Ordre 1", "Ordre 2"]
       }`;
-    } else { 
-      systemInstruction = "Tu es un architecte expert en sécurité incendie.";
-      userPrompt = `Analyse ce plan. Retourne UNIQUEMENT un JSON valide (sans Markdown) avec cette structure:
+    } else {
+      systemPrompt = `Tu es un expert en sécurité incendie résidentielle.
+      Analyse ce plan pour la prévention.
+      Structure JSON OBLIGATOIRE :
       {
         "summary": "Description générale.",
         "high_risk_zones": [{"name": "...", "risk_level": 80, "reason": "..."}],
         "evacuation_routes": ["..."],
         "access_points": ["..."],
-        "fire_propagation": {"estimated_time_critical": "...", "critical_zones": ["..."]},
+        "fire_propagation": {"estimated_time": "...", "critical_zones": []},
         "safety_recommendations": ["..."],
         "overall_risk_score": 5
       }`;
     }
-    
-    const requestBodyGemini = {
-      contents: [{
-        parts: [
-          { text: systemInstruction + "\n\n" + userPrompt }, 
-          { inline_data: { mime_type: mimeType, data: base64Image } }
-        ]
-      }],
-      generationConfig: { response_mime_type: "application/json" }
-    };
 
-    console.log(`[House ${houseId}] Appel Gemini (Tentative 1: ${targetModel})...`);
+    userPrompt = promptInstruction || "Analyse ce plan.";
 
-    // --- Appel API avec Retry/Fallback ---
-    let geminiResponse = await callGemini(targetModel, googleApiKey, requestBodyGemini);
+    // 5. Appel Google Gemini (Mode JSON forcé)
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${googleApiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{
+            parts: [
+              { text: systemPrompt + "\n\n" + userPrompt },
+              {
+                inline_data: {
+                  mime_type: "image/jpeg",
+                  data: base64Image
+                }
+              }
+            ]
+          }],
+          // Forcer la réponse en JSON pur
+          generationConfig: {
+            response_mime_type: "application/json"
+          }
+        })
+      }
+    );
 
-    // Si 404 sur le modèle Flash, on tente le modèle Pro
-    if (geminiResponse.status === 404) {
-        console.warn(`[House ${houseId}] Modèle ${targetModel} introuvable (404). Tentative avec gemini-1.5-pro-002...`);
-        targetModel = "gemini-1.5-pro-002";
-        geminiResponse = await callGemini(targetModel, googleApiKey, requestBodyGemini);
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`Google API Error: ${errText}`);
     }
 
-    if (!geminiResponse.ok) {
-      const errText = await geminiResponse.text();
-      // Log détaillé pour débogage
-      console.error(`[House ${houseId}] Erreur Gemini Finale (${geminiResponse.status}): ${errText}`);
-      throw new Error(`Erreur API Google (${geminiResponse.status}) sur le modèle ${targetModel}: ${errText}`);
-    }
-
-    const geminiData = await geminiResponse.json();
-    let analysisText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text;
+    const aiData = await response.json();
     
-    if (!analysisText) {
-      throw new Error("Réponse Gemini vide.");
-    }
-
-    analysisText = analysisText.replace(/```json/g, '').replace(/```/g, '').trim();
+    // Extraction et Parsing
+    // Gemini en mode JSON renvoie directement le JSON dans le texte
+    const jsonString = aiData.candidates?.[0]?.content?.parts?.[0]?.text;
     
-    let analysis: Record<string, any>;
+    if (!jsonString) throw new Error("Réponse vide de Gemini");
+
+    let analysis;
     try {
-      analysis = JSON.parse(analysisText);
+      analysis = JSON.parse(jsonString);
     } catch (e) {
-      analysis = { parsing_error: "JSON invalide", raw_text: analysisText };
+      console.error("Erreur parsing JSON Gemini:", jsonString);
+      // Tentative de nettoyage si jamais il y a du markdown résiduel (rare avec response_mime_type)
+      const cleanText = jsonString.replace(/```json|```/g, '').trim();
+      try {
+        analysis = JSON.parse(cleanText);
+      } catch {
+        analysis = { summary: "Erreur format", operational_summary: jsonString };
+      }
     }
 
-    console.log(`[House ${houseId}] Analyse reçue. Sauvegarde...`);
+    console.log('Analyse terminée. Sauvegarde...');
 
-    // --- Sauvegarde DB ---
-    const { data: currentHouse } = await supabaseClient
-      .from('houses')
-      .select('plan_analysis')
-      .eq('id', houseId)
-      .single();
+    // 6. Sauvegarde en Base (Fusion intelligente)
+    const { data: current } = await supabase.from('houses').select('plan_analysis').eq('id', houseId).single();
     
-    const existingAnalysis = (currentHouse?.plan_analysis as Record<string,any>) || {};
-    let finalAnalysis: Record<string, any>;
-
-    if (isOperationalMode) {
-      finalAnalysis = { ...existingAnalysis, operational_report: analysis };
-    } else {
-      const existingOp = existingAnalysis.operational_report;
-      finalAnalysis = { ...existingAnalysis, ...analysis };
-      if (existingOp) finalAnalysis.operational_report = existingOp;
+    let final = analysis;
+    if (current?.plan_analysis && typeof current.plan_analysis === 'object') {
+      if (mode === 'operational') {
+        final = { ...current.plan_analysis, operational_report: analysis };
+      } else {
+        const op = current.plan_analysis.operational_report;
+        final = { ...analysis, operational_report: op };
+      }
+    } else if (mode === 'operational') {
+      final = { operational_report: analysis };
     }
 
-    const { error: updateError } = await supabaseClient
-      .from('houses')
-      .update({
-        plan_analysis: finalAnalysis,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', houseId);
+    await supabase.from('houses').update({
+      plan_analysis: final,
+      updated_at: new Date().toISOString()
+    }).eq('id', houseId);
 
-    if (updateError) throw updateError;
-
-    return new Response(JSON.stringify({ 
-        success: true, 
-        message: "Succès",
-        analysis: finalAnalysis 
-    }), {
+    return new Response(JSON.stringify({ success: true, analysis: final }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       status: 200
     });
 
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    console.error(`[House ${houseId ?? 'N/A'}] ERREUR:`, errorMessage);
-
+    console.error('Erreur:', error);
     return new Response(JSON.stringify({ 
-      error: 'Erreur interne.',
-      details: errorMessage, 
-      houseId: houseId ?? 'N/A'
+      error: error instanceof Error ? error.message : 'Unknown error' 
     }), {
       status: 500,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }

@@ -1,6 +1,7 @@
 import "https://deno.land/x/xhr@0.1.0/mod.ts";
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.7.1';
+// Import de l'encodeur Base64 standard de Deno pour éviter le crash mémoire sur gros fichiers
 import { encode } from "https://deno.land/std@0.168.0/encoding/base64.ts";
 
 const corsHeaders = {
@@ -9,7 +10,7 @@ const corsHeaders = {
 };
 
 serve(async (req) => {
-  // Gestion des requêtes préliminaires (CORS)
+  // Gestion des requêtes preflight (CORS)
   if (req.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders });
   }
@@ -40,9 +41,11 @@ serve(async (req) => {
 
     try {
       const urlObj = new URL(planUrl);
-      // Extraction propre du chemin du fichier
       const pathParts = urlObj.pathname.split('house-plans/');
-      if (pathParts.length < 2) throw new Error("Format d'URL non reconnu");
+      
+      if (pathParts.length < 2) {
+        throw new Error("Format d'URL non reconnu");
+      }
       
       const filePath = decodeURIComponent(pathParts[1]);
       console.log(`Downloading internally: ${filePath}`);
@@ -65,7 +68,7 @@ serve(async (req) => {
     // Encodage Base64 robuste
     const base64Image = encode(new Uint8Array(imageBuffer));
 
-    console.log('Starting analysis with Google Gemini 2.0...');
+    console.log('Starting analysis with Google Gemini...');
 
     // 4. Préparation des Prompts
     let systemInstruction = "";
@@ -101,8 +104,8 @@ serve(async (req) => {
     }
 
     // 5. Appel Direct à Google Gemini
-    // MISE A JOUR : Utilisation du modèle présent dans votre liste
-    const modelVersion = "gemini-2.0-flash"; 
+    // CORRECTION ICI : Utilisation explicite de 'gemini-1.5-flash-latest'
+    const modelVersion = "gemini-1.5-flash-latest"; 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelVersion}:generateContent?key=${googleApiKey}`;
     
     const requestBody = {
